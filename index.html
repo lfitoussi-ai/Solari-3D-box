@@ -49,5 +49,621 @@ function renderFloor(c,stacks){const maxW=Math.min(880,Math.max(280,window.inner
 function runSelfTests(){console.assert(Array.isArray(colors)&&colors.length>=3,'colors array');console.assert(stackCapacity({height:500},{height:1200})===2,'stack capacity');console.assert(orientations({length:1200,width:600},{length:1000,width:1300}).length===1,'rotation fit');const sol=optimize({length:2000,width:1000,height:1000},[{name:'A',length:1000,width:500,height:500,quantity:5}]);console.assert(sol.remaining[0].loaded===5,'simple optimization loads 5')}
 renderContainerDropdown();renderContainersTable();renderProductDropdown();renderBoxesTable();runSelfTests();runOptimization();
 </script>
+<script>
+/* Deuxieme logique : la demande determine les conteneurs, sans modifier le mode manuel. */
+const legacyRunOptimization=runOptimization;
+const legacyRenderResult=renderResult;
+let optimizationMode='manual';
+let autoContainerTypeIndexes=new Set(containerTypes.map((_,i)=>i));
+const AUTO_EXACT_SEARCH_MAX=40;
+
+function cleanRequestedBoxes(){return boxes.filter(b=>b.name&&b.length>0&&b.width>0&&b.height>0&&b.quantity>0).map(b=>({...b,quantity:Number(b.quantity)}))}
+function copyContainer(c){return{name:c.name,length:c.length,width:c.width,height:c.height}}
+function containerVolume(c){return c.length*c.width*c.height}
+function remainingBoxCount(data){return data.remaining.reduce((sum,b)=>sum+(Number(b.quantity)||0),0)}
+function loadedVolume(data){return data.containers.reduce((sum,item)=>sum+item.solution.stacks.reduce((inner,stack)=>inner+stack.length*stack.width*stack.boxHeight*stack.stackCount,0),0)}
+function fillRatio(data){const capacity=data.containers.reduce((sum,item)=>sum+containerVolume(item.container),0);return capacity?loadedVolume(data)/capacity:0}
+function getAutoContainerTypes(){return containerTypes.filter((_,i)=>autoContainerTypeIndexes.has(i))}
+function fitsContainerType(box,c){return box.height<=c.height&&orientations(box,c).length>0}
+
+function buildGreedyAutoPlan(original,types){
+  let remaining=original.map(b=>({...b}));
+  const selected=[];
+  const maximumRuns=original.reduce((sum,b)=>sum+b.quantity,0);
+  for(let run=0;run<maximumRuns&&remaining.some(b=>b.quantity>0);run++){
+    let choice=null;
+    types.forEach(type=>{
+      const solution=optimize(type,remaining);
+      const loaded=solution.remaining.reduce((sum,b)=>sum+b.loaded,0);
+      const volume=solution.stacks.reduce((sum,stack)=>sum+stack.length*stack.width*stack.boxHeight*stack.stackCount,0);
+      if(!choice||loaded>choice.loaded||(loaded===choice.loaded&&volume>choice.volume))choice={type,solution,loaded,volume};
+    });
+    if(!choice||!choice.loaded)return null;
+    selected.push(copyContainer(choice.type));
+    remaining=remaining.map((box,i)=>({...box,quantity:choice.solution.remaining[i]?choice.solution.remaining[i].remaining:box.quantity}));
+  }
+  const data=optimizeAll(selected,original);
+  return remainingBoxCount(data)===0?{containers:selected,data}:null;
+}
+
+function generateContainerMixes(typeCount,total){
+  const mixes=[],counts=Array(typeCount).fill(0);
+  function visit(index,left){
+    if(index===typeCount-1){counts[index]=left;mixes.push([...counts]);return}
+    for(let count=0;count<=left;count++){counts[index]=count;visit(index+1,left-count)}
+  }
+  visit(0,total);
+  return mixes;
+}
+function listFromMix(types,mix,order){
+  const groups=types.map((type,i)=>Array.from({length:mix[i]},()=>copyContainer(type)));
+  if(order==='descending')return groups.flat().sort((a,b)=>containerVolume(b)-containerVolume(a));
+  if(order==='ascending')return groups.flat().sort((a,b)=>containerVolume(a)-containerVolume(b));
+  const result=[],remaining=[...mix];
+  while(remaining.some(count=>count>0))for(let i=0;i<remaining.length;i++)if(remaining[i]>0){result.push(copyContainer(types[i]));remaining[i]--}
+  return result;
+}
+function greedyOrderForMix(types,mix,original){
+  const remainingCounts=[...mix],result=[];
+  let remaining=original.map(b=>({...b}));
+  while(remainingCounts.some(count=>count>0)){
+    let choice=null;
+    remainingCounts.forEach((count,i)=>{
+      if(!count)return;
+      const solution=optimize(types[i],remaining);
+      const loaded=solution.remaining.reduce((sum,b)=>sum+b.loaded,0);
+      const volume=solution.stacks.reduce((sum,stack)=>sum+stack.length*stack.width*stack.boxHeight*stack.stackCount,0);
+      if(!choice||loaded>choice.loaded||(loaded===choice.loaded&&volume>choice.volume))choice={i,solution,loaded,volume};
+    });
+    if(!choice)return result;
+    result.push(copyContainer(types[choice.i]));
+    remainingCounts[choice.i]--;
+    remaining=remaining.map((box,i)=>({...box,quantity:choice.solution.remaining[i]?choice.solution.remaining[i].remaining:box.quantity}));
+  }
+  return result;
+}
+function isBetterPlacement(next,current){
+  if(!current)return true;
+  const nextRemaining=remainingBoxCount(next.data),currentRemaining=remainingBoxCount(current.data);
+  if(nextRemaining!==currentRemaining)return nextRemaining<currentRemaining;
+  const nextFill=fillRatio(next.data),currentFill=fillRatio(current.data);
+  return nextFill>currentFill;
+}
+function evaluateContainerMix(types,mix,original){
+  const lists=[
+    listFromMix(types,mix,'descending'),
+    listFromMix(types,mix,'ascending'),
+    listFromMix(types,mix,'alternating'),
+    greedyOrderForMix(types,mix,original)
+  ];
+  const seen=new Set();
+  let best=null;
+  lists.forEach(list=>{
+    const signature=list.map(c=>c.name).join('|');
+    if(!list.length||seen.has(signature))return;
+    seen.add(signature);
+    const candidate={containers:list,data:optimizeAll(list,original)};
+    if(isBetterPlacement(candidate,best))best=candidate;
+  });
+  return best;
+}
+function recommendContainers(original,types){
+  const unsupported=original.filter(box=>!types.some(type=>fitsContainerType(box,type)));
+  if(unsupported.length)return{unsupported};
+  const fallback=buildGreedyAutoPlan(original,types);
+  if(!fallback)return{failure:true};
+  const totalVolume=original.reduce((sum,b)=>sum+b.length*b.width*b.height*b.quantity,0);
+  const lowerBound=Math.max(1,Math.ceil(totalVolume/Math.max(...types.map(containerVolume))));
+  const searchEnd=Math.min(fallback.containers.length,AUTO_EXACT_SEARCH_MAX);
+  for(let count=lowerBound;count<=searchEnd;count++){
+    let bestAtCount=null;
+    generateContainerMixes(types.length,count).forEach(mix=>{
+      const candidate=evaluateContainerMix(types,mix,original);
+      if(isBetterPlacement(candidate,bestAtCount))bestAtCount=candidate;
+    });
+    if(bestAtCount&&remainingBoxCount(bestAtCount.data)===0)return{...bestAtCount,searchComplete:true};
+  }
+  return{...fallback,searchComplete:fallback.containers.length<=AUTO_EXACT_SEARCH_MAX};
+}
+
+function formatContainerMix(containerList){
+  const counts=new Map();
+  containerList.forEach(c=>counts.set(c.name,(counts.get(c.name)||0)+1));
+  return [...counts].map(([name,count])=>`${count} × ${name}`).join(' + ');
+}
+function renderAutomaticResult(plan,types){
+  const manualContainers=containers;
+  containers=plan.data.containers.map(item=>copyContainer(item.container));
+  legacyRenderResult(plan.data);
+  containers=manualContainers;
+  const detail=plan.searchComplete
+    ?'Nombre de conteneurs minimisé parmi les combinaisons évaluées, puis meilleur remplissage retenu.'
+    :`Plan de repli obtenu automatiquement. La recherche détaillée est limitée à ${AUTO_EXACT_SEARCH_MAX} conteneurs.`;
+  document.getElementById('result').insertAdjacentHTML('afterbegin',`<div class="auto-summary"><strong>Recommandation automatique : ${esc(formatContainerMix(plan.containers))}</strong><span>Logique produits → conteneurs. ${detail}</span><span class="small">Formats évalués : ${esc(types.map(t=>t.name).join(', '))}.</span></div>`);
+}
+function showAutomaticMessage(message){document.getElementById('result').innerHTML=`<div class="message">${message}</div>`}
+function runAutomaticOptimization(){
+  const requested=cleanRequestedBoxes();
+  if(!requested.length){showAutomaticMessage('Ajoute au moins un produit à charger pour calculer les conteneurs.');return}
+  const types=getAutoContainerTypes();
+  if(!types.length){showAutomaticMessage('Sélectionne au moins un type de conteneur autorisé.');return}
+  const plan=recommendContainers(requested,types);
+  if(plan.unsupported){showAutomaticMessage(`Aucun format sélectionné ne peut accueillir : <strong>${plan.unsupported.map(b=>esc(b.name)).join(', ')}</strong>.`);return}
+  if(!plan.data){showAutomaticMessage('Aucune solution de chargement n’a pu être calculée avec les formats sélectionnés.');return}
+  renderAutomaticResult(plan,types);
+}
+function runOptimization(){if(optimizationMode==='auto')runAutomaticOptimization();else legacyRunOptimization()}
+
+function renderAutoContainerOptions(){
+  const target=document.getElementById('autoContainerOptions');
+  if(!target)return;
+  target.innerHTML=containerTypes.map((c,i)=>`<label class="auto-type-option"><input type="checkbox" ${autoContainerTypeIndexes.has(i)?'checked':''} onchange="setAutoContainerType(${i},this.checked)"><span><strong>${esc(c.name)}</strong><small>${c.length} × ${c.width} × ${c.height} mm</small></span></label>`).join('');
+}
+function refreshOptimizationModeUI(){
+  const auto=optimizationMode==='auto';
+  const manualSection=document.getElementById('manualContainersSection');
+  const settings=document.getElementById('autoModeSettings');
+  if(manualSection)manualSection.hidden=auto;
+  if(settings)settings.hidden=!auto;
+  document.querySelectorAll('[data-optimization-mode]').forEach(label=>label.classList.toggle('is-active',label.dataset.optimizationMode===optimizationMode));
+  const radio=document.querySelector(`input[name="optimizationMode"][value="${optimizationMode}"]`);
+  if(radio)radio.checked=true;
+}
+function setOptimizationMode(mode){optimizationMode=mode==='auto'?'auto':'manual';refreshOptimizationModeUI();runOptimization()}
+function setAutoContainerType(index,enabled){if(enabled)autoContainerTypeIndexes.add(index);else autoContainerTypeIndexes.delete(index);runOptimization()}
+function installOptimizationModeUI(){
+  const manualSection=document.querySelector('main .card');
+  if(!manualSection)return;
+  manualSection.id='manualContainersSection';
+  document.head.insertAdjacentHTML('beforeend','<style>.mode-options{display:grid;grid-template-columns:1fr;gap:10px}.mode-option,.auto-type-option{display:flex;gap:10px;align-items:flex-start;padding:12px;border:1px solid var(--border);border-radius:12px;background:#fff;cursor:pointer}.mode-option.is-active{border-color:var(--primary);box-shadow:0 0 0 3px rgba(31,111,235,.12)}.mode-option input,.auto-type-option input{width:auto;min-height:auto;margin:3px 0 0}.mode-option span,.auto-type-option span{display:grid;gap:3px}.mode-option small,.auto-type-option small{color:var(--muted)}.auto-type-options{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px}@media(min-width:620px){.auto-type-options{grid-template-columns:repeat(2,1fr)}}.auto-summary{display:grid;gap:6px;padding:14px;border:1px solid #b9d0fb;border-radius:14px;background:#edf4ff;margin-bottom:16px}.auto-summary strong{color:#174ea6}</style>');
+  manualSection.insertAdjacentHTML('beforebegin','<section class="card" id="optimizationModeCard"><h2>Mode d’optimisation</h2><div class="mode-options"><label class="mode-option is-active" data-optimization-mode="manual"><input type="radio" name="optimizationMode" value="manual" checked onchange="setOptimizationMode(this.value)"><span><strong>Conteneurs définis manuellement</strong><small>Mode actuel : choisis les conteneurs, puis charge les produits.</small></span></label><label class="mode-option" data-optimization-mode="auto"><input type="radio" name="optimizationMode" value="auto" onchange="setOptimizationMode(this.value)"><span><strong>Calculer les conteneurs automatiquement</strong><small>Partir des produits, puis recommander le nombre et le mix de conteneurs.</small></span></label></div><div id="autoModeSettings" hidden><h3>Formats autorisés pour le calcul</h3><p class="small">Seuls les formats cochés seront utilisés pour construire la recommandation.</p><div id="autoContainerOptions" class="auto-type-options"></div></div></section>');
+  renderAutoContainerOptions();
+  refreshOptimizationModeUI();
+}
+function runAutomaticSelfTests(){
+  const testTypes=[{name:'Test compact',length:1000,width:1000,height:1000},{name:'Test long',length:2000,width:1000,height:1000}];
+  const loaded=recommendContainers([{name:'A',length:500,width:500,height:500,quantity:2}],testTypes);
+  console.assert(loaded.data&&remainingBoxCount(loaded.data)===0,'automatic planner loads all boxes');
+  console.assert(loaded.data&&loaded.data.containers.length===1,'automatic planner starts with the minimum container count');
+  const rejected=recommendContainers([{name:'Trop haut',length:100,width:100,height:1500,quantity:1}],testTypes);
+  console.assert(rejected.unsupported&&rejected.unsupported.length===1,'automatic planner reports incompatible boxes');
+}
+installOptimizationModeUI();
+runAutomaticSelfTests();
+runOptimization();
+</script>
+<script>
+/* Base de donnees locale : catalogue de produits et simulations sauvegardees dans ce navigateur. */
+const LOCAL_DATABASE_KEYS={products:'solari-container-products-v1',simulations:'solari-container-simulations-v1'};
+const localDatabaseMemory=Object.create(null);
+
+function readLocalDatabase(key){
+  try{
+    const raw=window.localStorage.getItem(key);
+    const data=raw?JSON.parse(raw):[];
+    return Array.isArray(data)?data:[];
+  }catch(_){return Array.isArray(localDatabaseMemory[key])?localDatabaseMemory[key]:[]}
+}
+function writeLocalDatabase(key,data){
+  localDatabaseMemory[key]=data;
+  try{window.localStorage.setItem(key,JSON.stringify(data));return true}catch(_){return false}
+}
+function localRecordId(prefix){return prefix+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)}
+function catalogProducts(){
+  const base=productCatalog.map((product,index)=>({id:'base-'+index,...product,source:'base'}));
+  const custom=readLocalDatabase(LOCAL_DATABASE_KEYS.products).map(product=>({...product,source:'custom'}));
+  return [...base,...custom];
+}
+function renderProductDropdown(){
+  const select=document.getElementById('productSelect');
+  if(!select)return;
+  const selected=select.value;
+  const options=catalogProducts().map(product=>'<option value="'+esc(product.id)+'">'+esc(product.name)+' - '+product.length+'x'+product.width+'x'+product.height+'</option>').join('');
+  select.innerHTML=options;
+  if([...select.options].some(option=>option.value===selected))select.value=selected;
+}
+function addSelectedProduct(){
+  const select=document.getElementById('productSelect');
+  const product=catalogProducts().find(item=>item.id===select.value);
+  const quantity=Math.max(1,Number(document.getElementById('productQuantity').value)||1);
+  if(!product)return;
+  addOrIncreaseBox({name:product.name,length:product.length,width:product.width,height:product.height,quantity});
+  document.getElementById('productQuantity').value=1;
+  renderBoxesTable();
+  runOptimization();
+}
+function setDatabaseStatus(message){
+  const target=document.getElementById('databaseStatus');
+  if(target)target.textContent=message;
+}
+function renderCustomProducts(){
+  const target=document.getElementById('customProductsList');
+  if(!target)return;
+  const products=readLocalDatabase(LOCAL_DATABASE_KEYS.products);
+  if(!products.length){target.innerHTML='<p class="small">Aucun produit personnalisé enregistré.</p>';return}
+  target.innerHTML='<div class="table-scroll"><table><thead><tr><th>Produit</th><th>Longueur</th><th>Largeur</th><th>Hauteur</th><th></th></tr></thead><tbody>'+products.map(product=>'<tr><td>'+esc(product.name)+'</td><td>'+product.length+'</td><td>'+product.width+'</td><td>'+product.height+'</td><td><button class="danger" aria-label="Supprimer '+esc(product.name)+'" onclick="deleteCustomProduct(\''+esc(product.id)+'\')">x</button></td></tr>').join('')+'</tbody></table></div>';
+}
+function addCatalogProduct(){
+  const name=document.getElementById('databaseProductName').value.trim();
+  const length=Number(document.getElementById('databaseProductLength').value);
+  const width=Number(document.getElementById('databaseProductWidth').value);
+  const height=Number(document.getElementById('databaseProductHeight').value);
+  if(!name||![length,width,height].every(value=>Number.isFinite(value)&&value>0)){setDatabaseStatus('Renseigne un nom et trois dimensions positives.');return}
+  const products=readLocalDatabase(LOCAL_DATABASE_KEYS.products);
+  if(products.some(product=>product.name.toLowerCase()===name.toLowerCase()&&product.length===length&&product.width===width&&product.height===height)){setDatabaseStatus('Ce produit existe déjà dans le catalogue local.');return}
+  products.push({id:localRecordId('product'),name,length,width,height,createdAt:new Date().toISOString()});
+  writeLocalDatabase(LOCAL_DATABASE_KEYS.products,products);
+  document.getElementById('databaseProductName').value='';
+  document.getElementById('databaseProductLength').value='';
+  document.getElementById('databaseProductWidth').value='';
+  document.getElementById('databaseProductHeight').value='';
+  renderProductDropdown();
+  renderCustomProducts();
+  setDatabaseStatus('Produit ajouté au catalogue local.');
+}
+function deleteCustomProduct(id){
+  const products=readLocalDatabase(LOCAL_DATABASE_KEYS.products).filter(product=>product.id!==id);
+  writeLocalDatabase(LOCAL_DATABASE_KEYS.products,products);
+  renderProductDropdown();
+  renderCustomProducts();
+  setDatabaseStatus('Produit retiré du catalogue local.');
+}
+
+function simulationSummary(simulation){
+  const mode=simulation.optimizationMode==='auto'?'Automatique':'Manuel';
+  const productCount=(simulation.boxes||[]).reduce((sum,box)=>sum+(Number(box.quantity)||0),0);
+  const containerCount=(simulation.containers||[]).length;
+  return mode+' · '+productCount+' boîte(s) · '+containerCount+' conteneur(s)';
+}
+function renderSavedSimulations(){
+  const target=document.getElementById('savedSimulationsList');
+  if(!target)return;
+  const simulations=readLocalDatabase(LOCAL_DATABASE_KEYS.simulations);
+  if(!simulations.length){target.innerHTML='<p class="small">Aucune simulation enregistrée.</p>';return}
+  target.innerHTML='<div class="saved-simulation-list">'+simulations.slice().reverse().map(simulation=>'<article class="saved-simulation"><div><strong>'+esc(simulation.name)+'</strong><span>'+esc(simulationSummary(simulation))+'</span><small>'+esc(new Date(simulation.createdAt).toLocaleString('fr-FR'))+'</small></div><div class="actions"><button class="secondary" onclick="loadSavedSimulation(\''+esc(simulation.id)+'\')">Charger</button><button class="danger" aria-label="Supprimer '+esc(simulation.name)+'" onclick="deleteSavedSimulation(\''+esc(simulation.id)+'\')">x</button></div></article>').join('')+'</div>';
+}
+function saveCurrentSimulation(){
+  const requested=cleanRequestedBoxes();
+  if(!requested.length){setDatabaseStatus('Ajoute au moins un produit avant d’enregistrer une simulation.');return}
+  const nameInput=document.getElementById('simulationName');
+  const name=nameInput.value.trim()||'Simulation du '+new Date().toLocaleString('fr-FR');
+  const simulations=readLocalDatabase(LOCAL_DATABASE_KEYS.simulations);
+  simulations.push({
+    id:localRecordId('simulation'),
+    name,
+    createdAt:new Date().toISOString(),
+    optimizationMode,
+    autoContainerTypeIndexes:[...autoContainerTypeIndexes],
+    containers:containers.map((container,index)=>({id:Number(container.id)||index+1,...copyContainer(container)})),
+    boxes:requested.map(box=>({name:box.name,length:box.length,width:box.width,height:box.height,quantity:box.quantity}))
+  });
+  writeLocalDatabase(LOCAL_DATABASE_KEYS.simulations,simulations);
+  nameInput.value='';
+  renderSavedSimulations();
+  setDatabaseStatus('Simulation enregistrée sur cet appareil.');
+}
+function loadSavedSimulation(id){
+  const simulation=readLocalDatabase(LOCAL_DATABASE_KEYS.simulations).find(item=>item.id===id);
+  if(!simulation)return;
+  containers=(simulation.containers||[]).map((container,index)=>({id:Number(container.id)||index+1,...copyContainer(container)}));
+  nextContainerId=Math.max(0,...containers.map(container=>Number(container.id)||0))+1;
+  boxes=(simulation.boxes||[]).map(box=>({name:box.name,length:Number(box.length),width:Number(box.width),height:Number(box.height),quantity:Number(box.quantity)}));
+  optimizationMode=simulation.optimizationMode==='auto'?'auto':'manual';
+  autoContainerTypeIndexes=new Set(Array.isArray(simulation.autoContainerTypeIndexes)?simulation.autoContainerTypeIndexes:containerTypes.map((_,index)=>index));
+  renderContainersTable();
+  renderBoxesTable();
+  renderProductDropdown();
+  renderAutoContainerOptions();
+  refreshOptimizationModeUI();
+  runOptimization();
+  setDatabaseStatus('Simulation chargée.');
+}
+function deleteSavedSimulation(id){
+  const simulations=readLocalDatabase(LOCAL_DATABASE_KEYS.simulations).filter(simulation=>simulation.id!==id);
+  writeLocalDatabase(LOCAL_DATABASE_KEYS.simulations,simulations);
+  renderSavedSimulations();
+  setDatabaseStatus('Simulation supprimée de cet appareil.');
+}
+function installLocalDatabaseUI(){
+  if(document.getElementById('productDatabaseCard'))return;
+  const productSection=document.getElementById('productSelect').closest('.card');
+  const resultSection=document.getElementById('result').closest('.card');
+  if(!productSection||!resultSection)return;
+  document.head.insertAdjacentHTML('beforeend','<style>.database-grid{display:grid;grid-template-columns:1fr;gap:10px}.database-actions{display:flex;align-items:end}@media(min-width:760px){.database-grid{grid-template-columns:2fr repeat(3,1fr) auto}.database-actions button{width:auto}}.database-status{min-height:20px;margin:12px 0 0;color:var(--ok);font-size:13px}.saved-simulation-list{display:grid;gap:10px}.saved-simulation{display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:#f8faff}.saved-simulation>div:first-child{display:grid;gap:3px}.saved-simulation span,.saved-simulation small{color:var(--muted);font-size:13px}.saved-simulation .actions{margin:0;align-items:center}@media(min-width:620px){.saved-simulation{flex-direction:row;align-items:center;justify-content:space-between}.saved-simulation .actions{flex-direction:row}}</style>');
+  productSection.insertAdjacentHTML('beforebegin','<section class="card" id="productDatabaseCard"><h2>Catalogue de produits</h2><p>Ajoute tes références et leurs dimensions. Elles seront disponibles dans la liste de produits et enregistrées localement dans ce navigateur.</p><div class="database-grid"><div><label for="databaseProductName">Nom du produit</label><input id="databaseProductName" placeholder="Ex. Nouveau modèle"></div><div><label for="databaseProductLength">Longueur (mm)</label><input id="databaseProductLength" type="number" min="1"></div><div><label for="databaseProductWidth">Largeur (mm)</label><input id="databaseProductWidth" type="number" min="1"></div><div><label for="databaseProductHeight">Hauteur (mm)</label><input id="databaseProductHeight" type="number" min="1"></div><div class="database-actions"><button onclick="addCatalogProduct()">Ajouter au catalogue</button></div></div><div id="databaseStatus" class="database-status" aria-live="polite"></div><h3>Produits personnalisés</h3><div id="customProductsList"></div></section>');
+  resultSection.insertAdjacentHTML('beforebegin','<section class="card" id="savedSimulationsCard"><h2>Simulations enregistrées</h2><p>Enregistre les produits, les conteneurs et le mode de calcul pour reprendre une simulation plus tard.</p><div class="picker"><div><label for="simulationName">Nom de la simulation</label><input id="simulationName" placeholder="Ex. Commande octobre"></div><div><button onclick="saveCurrentSimulation()">Enregistrer</button></div></div><div id="savedSimulationsList"></div></section>');
+  renderProductDropdown();
+  renderCustomProducts();
+  renderSavedSimulations();
+}
+installLocalDatabaseUI();
+</script>
+<script src="supabase-config.js"></script>
+<script>
+/* Source de donnees Supabase. Les anciennes fonctions locales sont surchargees ici. */
+const packingCatalogAdditions=[
+  {name:'U6 EV',length:2925,width:1490,height:1950},
+  {name:'AE7 Pro',length:1826,width:735,height:1105}
+];
+packingCatalogAdditions.forEach(product=>{
+  if(!productCatalog.some(existing=>existing.name===product.name&&existing.length===product.length&&existing.width===product.width&&existing.height===product.height))productCatalog.push(product);
+});
+let supabaseProducts=[];
+let supabaseSimulations=[];
+
+function getSupabaseConfig(){
+  const config=window.SOLARI_SUPABASE_CONFIG||{};
+  const url=String(config.url||'').replace(/\/$/,'');
+  const publishableKey=String(config.publishableKey||'');
+  if(!/^https:\/\/.+\.supabase\.co$/i.test(url)||!publishableKey||publishableKey.indexOf('YOUR_')>=0)return null;
+  return{url,publishableKey};
+}
+function supabaseIsConfigured(){return!!getSupabaseConfig()}
+async function supabaseRequest(path,options){
+  const config=getSupabaseConfig();
+  if(!config)throw new Error('Supabase n’est pas configuré.');
+  const request=options||{};
+  const headers=Object.assign({
+    apikey:config.publishableKey,
+    Authorization:'Bearer '+config.publishableKey
+  },request.headers||{});
+  if(request.body)headers['Content-Type']='application/json';
+  const response=await fetch(config.url+'/rest/v1/'+path,Object.assign({},request,{headers}));
+  if(!response.ok){
+    const detail=await response.text();
+    throw new Error(detail||'Erreur Supabase ('+response.status+').');
+  }
+  if(response.status===204)return null;
+  return response.json();
+}
+function catalogProducts(){
+  const base=productCatalog.map((product,index)=>({id:'base-'+index,...product,source:'base'}));
+  const shared=supabaseProducts.map(product=>({id:'shared-'+product.id,name:product.name,length:product.length_mm,width:product.width_mm,height:product.height_mm,source:'supabase'}));
+  return [...base,...shared];
+}
+function renderProductDropdown(){
+  const select=document.getElementById('productSelect');
+  if(!select)return;
+  const selected=select.value;
+  select.innerHTML=catalogProducts().map(product=>'<option value="'+esc(product.id)+'">'+esc(product.name)+' - '+product.length+'x'+product.width+'x'+product.height+'</option>').join('');
+  if([...select.options].some(option=>option.value===selected))select.value=selected;
+}
+function addSelectedProduct(){
+  const select=document.getElementById('productSelect');
+  const product=catalogProducts().find(item=>item.id===select.value);
+  const quantity=Math.max(1,Number(document.getElementById('productQuantity').value)||1);
+  if(!product)return;
+  addOrIncreaseBox({name:product.name,length:product.length,width:product.width,height:product.height,quantity});
+  document.getElementById('productQuantity').value=1;
+  renderBoxesTable();
+  runOptimization();
+}
+function renderCustomProducts(){
+  const target=document.getElementById('customProductsList');
+  if(!target)return;
+  if(!supabaseIsConfigured()){target.innerHTML='<p class="small">Configure Supabase pour afficher le catalogue partagé.</p>';return}
+  if(!supabaseProducts.length){target.innerHTML='<p class="small">Aucun produit partagé enregistré.</p>';return}
+  target.innerHTML='<div class="table-scroll"><table><thead><tr><th>Produit</th><th>Longueur</th><th>Largeur</th><th>Hauteur</th><th></th></tr></thead><tbody>'+supabaseProducts.map(product=>'<tr><td>'+esc(product.name)+'</td><td>'+product.length_mm+'</td><td>'+product.width_mm+'</td><td>'+product.height_mm+'</td><td><button class="danger" aria-label="Supprimer '+esc(product.name)+'" onclick="deleteCustomProduct('+Number(product.id)+')">x</button></td></tr>').join('')+'</tbody></table></div>';
+}
+async function addCatalogProduct(){
+  const name=document.getElementById('databaseProductName').value.trim();
+  const length=Number(document.getElementById('databaseProductLength').value);
+  const width=Number(document.getElementById('databaseProductWidth').value);
+  const height=Number(document.getElementById('databaseProductHeight').value);
+  if(!name||![length,width,height].every(value=>Number.isFinite(value)&&value>0)){setDatabaseStatus('Renseigne un nom et trois dimensions positives.');return}
+  if(!supabaseIsConfigured()){setDatabaseStatus('Renseigne d’abord supabase-config.js.');return}
+  try{
+    const created=await supabaseRequest('products',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({name,length_mm:length,width_mm:width,height_mm:height})});
+    supabaseProducts=(created||[]).concat(supabaseProducts).sort((a,b)=>a.name.localeCompare(b.name,'fr'));
+    document.getElementById('databaseProductName').value='';
+    document.getElementById('databaseProductLength').value='';
+    document.getElementById('databaseProductWidth').value='';
+    document.getElementById('databaseProductHeight').value='';
+    renderProductDropdown();
+    renderCustomProducts();
+    setDatabaseStatus('Produit ajouté au catalogue partagé.');
+  }catch(error){setDatabaseStatus('Ajout impossible : '+error.message)}
+}
+async function deleteCustomProduct(id){
+  if(!supabaseIsConfigured()){setDatabaseStatus('Renseigne d’abord supabase-config.js.');return}
+  try{
+    await supabaseRequest('products?id=eq.'+encodeURIComponent(id),{method:'DELETE'});
+    supabaseProducts=supabaseProducts.filter(product=>Number(product.id)!==Number(id));
+    renderProductDropdown();
+    renderCustomProducts();
+    setDatabaseStatus('Produit supprimé du catalogue partagé.');
+  }catch(error){setDatabaseStatus('Suppression impossible : '+error.message)}
+}
+
+function simulationSummary(simulation){
+  const mode=simulation.optimization_mode==='auto'?'Automatique':'Manuel';
+  const productCount=(simulation.boxes||[]).reduce((sum,box)=>sum+(Number(box.quantity)||0),0);
+  const containerCount=(simulation.containers||[]).length;
+  return mode+' · '+productCount+' boîte(s) · '+containerCount+' conteneur(s)';
+}
+function renderSavedSimulations(){
+  const target=document.getElementById('savedSimulationsList');
+  if(!target)return;
+  if(!supabaseIsConfigured()){target.innerHTML='<p class="small">Configure Supabase pour afficher les simulations partagées.</p>';return}
+  if(!supabaseSimulations.length){target.innerHTML='<p class="small">Aucune simulation partagée enregistrée.</p>';return}
+  target.innerHTML='<div class="saved-simulation-list">'+supabaseSimulations.map(simulation=>'<article class="saved-simulation"><div><strong>'+esc(simulation.name)+'</strong><span>'+esc(simulationSummary(simulation))+'</span><small>'+esc(new Date(simulation.created_at).toLocaleString('fr-FR'))+'</small></div><div class="actions"><button class="secondary" onclick="loadSavedSimulation('+Number(simulation.id)+')">Charger</button><button class="danger" aria-label="Supprimer '+esc(simulation.name)+'" onclick="deleteSavedSimulation('+Number(simulation.id)+')">x</button></div></article>').join('')+'</div>';
+}
+async function saveCurrentSimulation(){
+  const requested=cleanRequestedBoxes();
+  if(!requested.length){setDatabaseStatus('Ajoute au moins un produit avant d’enregistrer une simulation.');return}
+  if(!supabaseIsConfigured()){setDatabaseStatus('Renseigne d’abord supabase-config.js.');return}
+  const nameInput=document.getElementById('simulationName');
+  const name=nameInput.value.trim()||'Simulation du '+new Date().toLocaleString('fr-FR');
+  const payload={
+    name,
+    optimization_mode:optimizationMode,
+    auto_container_type_indexes:[...autoContainerTypeIndexes],
+    containers:containers.map((container,index)=>({id:Number(container.id)||index+1,...copyContainer(container)})),
+    boxes:requested.map(box=>({name:box.name,length:box.length,width:box.width,height:box.height,quantity:box.quantity}))
+  };
+  try{
+    const created=await supabaseRequest('simulations',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify(payload)});
+    supabaseSimulations=(created||[]).concat(supabaseSimulations);
+    nameInput.value='';
+    renderSavedSimulations();
+    setDatabaseStatus('Simulation enregistrée dans Supabase.');
+  }catch(error){setDatabaseStatus('Enregistrement impossible : '+error.message)}
+}
+function loadSavedSimulation(id){
+  const simulation=supabaseSimulations.find(item=>Number(item.id)===Number(id));
+  if(!simulation)return;
+  containers=(simulation.containers||[]).map((container,index)=>({id:Number(container.id)||index+1,...copyContainer(container)}));
+  nextContainerId=Math.max(0,...containers.map(container=>Number(container.id)||0))+1;
+  boxes=(simulation.boxes||[]).map(box=>({name:box.name,length:Number(box.length),width:Number(box.width),height:Number(box.height),quantity:Number(box.quantity)}));
+  optimizationMode=simulation.optimization_mode==='auto'?'auto':'manual';
+  autoContainerTypeIndexes=new Set(Array.isArray(simulation.auto_container_type_indexes)?simulation.auto_container_type_indexes:containerTypes.map((_,index)=>index));
+  renderContainersTable();
+  renderBoxesTable();
+  renderProductDropdown();
+  renderAutoContainerOptions();
+  refreshOptimizationModeUI();
+  runOptimization();
+  setDatabaseStatus('Simulation chargée depuis Supabase.');
+}
+async function deleteSavedSimulation(id){
+  if(!supabaseIsConfigured()){setDatabaseStatus('Renseigne d’abord supabase-config.js.');return}
+  try{
+    await supabaseRequest('simulations?id=eq.'+encodeURIComponent(id),{method:'DELETE'});
+    supabaseSimulations=supabaseSimulations.filter(simulation=>Number(simulation.id)!==Number(id));
+    renderSavedSimulations();
+    setDatabaseStatus('Simulation supprimée de Supabase.');
+  }catch(error){setDatabaseStatus('Suppression impossible : '+error.message)}
+}
+async function loadSupabaseData(){
+  if(!supabaseIsConfigured()){
+    renderProductDropdown();
+    renderCustomProducts();
+    renderSavedSimulations();
+    setDatabaseStatus('Supabase n’est pas encore configuré : renseigne supabase-config.js.');
+    return;
+  }
+  setDatabaseStatus('Connexion à Supabase…');
+  try{
+    const result=await Promise.all([
+      supabaseRequest('products?select=id,name,length_mm,width_mm,height_mm,created_at&order=name.asc'),
+      supabaseRequest('simulations?select=id,name,optimization_mode,auto_container_type_indexes,containers,boxes,created_at&order=created_at.desc')
+    ]);
+    supabaseProducts=result[0]||[];
+    supabaseSimulations=result[1]||[];
+    renderProductDropdown();
+    renderCustomProducts();
+    renderSavedSimulations();
+    setDatabaseStatus('Connecté à Supabase.');
+  }catch(error){
+    renderProductDropdown();
+    renderCustomProducts();
+    renderSavedSimulations();
+    setDatabaseStatus('Connexion Supabase impossible : '+error.message);
+  }
+}
+function installSupabaseDatabase(){
+  const catalogCard=document.getElementById('productDatabaseCard');
+  const simulationsCard=document.getElementById('savedSimulationsCard');
+  if(catalogCard){
+    const title=catalogCard.querySelector('h2');
+    const description=catalogCard.querySelector('p');
+    if(title)title.textContent='Catalogue de produits partagé';
+    if(description)description.textContent='Ajoute tes références et leurs dimensions. Elles seront partagées avec tous les visiteurs de l’application via Supabase.';
+  }
+  if(simulationsCard){
+    const description=simulationsCard.querySelector('p');
+    if(description)description.textContent='Enregistre les produits, les conteneurs et le mode de calcul dans la base Supabase partagée.';
+  }
+  loadSupabaseData();
+}
+function renderBoxesTable(){
+  const tbody=document.getElementById('boxesBody');
+  if(!tbody)return;
+  const table=tbody.closest('table');
+  const header=table?table.querySelector('thead tr'):null;
+  if(header)header.innerHTML='<th>Nom</th><th>Longueur</th><th>Largeur</th><th>Hauteur</th><th>Quantité</th><th>Catalogue</th><th></th>';
+  tbody.innerHTML='';
+  boxes.forEach((box,index)=>{
+    const row=document.createElement('tr');
+    row.className='row-input';
+    const catalogAction=box.isFreeLine
+      ?(box.catalogProductId?'<span class="ok">Ajouté</span>':'<button class="secondary" onclick="saveFreeBoxToCatalog('+index+')">Ajouter</button>')
+      :'<span class="small">—</span>';
+    row.innerHTML='<td><input value="'+esc(box.name)+'" onchange="updateBox('+index+',\'name\',this.value)"></td><td><input type="number" min="1" value="'+box.length+'" onchange="updateBox('+index+',\'length\',this.value)"></td><td><input type="number" min="1" value="'+box.width+'" onchange="updateBox('+index+',\'width\',this.value)"></td><td><input type="number" min="1" value="'+box.height+'" onchange="updateBox('+index+',\'height\',this.value)"></td><td><input type="number" min="0" value="'+box.quantity+'" onchange="updateBox('+index+',\'quantity\',this.value)"></td><td>'+catalogAction+'</td><td><button class="danger" onclick="removeBox('+index+')">x</button></td>';
+    tbody.appendChild(row);
+  });
+}
+function addBox(){
+  boxes.push({name:'Nouveau produit',length:1000,width:1000,height:1000,quantity:1,isFreeLine:true});
+  renderBoxesTable();
+  runOptimization();
+}
+async function saveFreeBoxToCatalog(index){
+  const box=boxes[index];
+  if(!box||!box.isFreeLine)return;
+  const name=String(box.name||'').trim();
+  const dimensions=[Number(box.length),Number(box.width),Number(box.height)];
+  if(!name||!dimensions.every(value=>Number.isFinite(value)&&value>0)){setDatabaseStatus('Renseigne un nom et trois dimensions positives sur la ligne libre.');return}
+  if(!supabaseIsConfigured()){setDatabaseStatus('Supabase n’est pas configuré.');return}
+  const existing=supabaseProducts.find(product=>product.name.toLowerCase()===name.toLowerCase()&&Number(product.length_mm)===dimensions[0]&&Number(product.width_mm)===dimensions[1]&&Number(product.height_mm)===dimensions[2]);
+  if(existing){
+    box.catalogProductId=existing.id;
+    renderBoxesTable();
+    setDatabaseStatus('Ce produit est déjà présent dans le catalogue partagé.');
+    return;
+  }
+  try{
+    const created=await supabaseRequest('products',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({name,length_mm:dimensions[0],width_mm:dimensions[1],height_mm:dimensions[2]})});
+    const product=created&&created[0];
+    if(!product)throw new Error('Supabase n’a pas retourné le produit créé.');
+    supabaseProducts=(supabaseProducts.concat([product])).sort((a,b)=>a.name.localeCompare(b.name,'fr'));
+    box.catalogProductId=product.id;
+    renderProductDropdown();
+    renderCustomProducts();
+    renderBoxesTable();
+    setDatabaseStatus('Produit ajouté au catalogue partagé.');
+  }catch(error){setDatabaseStatus('Ajout impossible : '+error.message)}
+}
+installSupabaseDatabase();
+renderBoxesTable();
+</script>
+<script>
+/* Le catalogue reste disponible, mais ne surcharge plus le parcours de simulation. */
+function setCatalogDisclosure(open){
+  const content=document.getElementById('productCatalogDisclosure');
+  const button=document.getElementById('catalogDisclosureButton');
+  if(!content||!button)return;
+  content.hidden=!open;
+  button.textContent=open?'Fermer le catalogue':'Consulter / modifier le catalogue';
+  button.setAttribute('aria-expanded',String(open));
+}
+function installCatalogDisclosure(){
+  const card=document.getElementById('productDatabaseCard');
+  if(!card||document.getElementById('productCatalogDisclosure'))return;
+  const main=card.closest('main');
+  if(main&&main.firstElementChild!==card)main.insertBefore(card,main.firstElementChild);
+  const title=Array.from(card.children).find(element=>element.tagName==='H2');
+  if(!title)return;
+  const disclosure=document.createElement('div');
+  disclosure.id='productCatalogDisclosure';
+  disclosure.hidden=true;
+  Array.from(card.children).filter(element=>element!==title).forEach(element=>disclosure.appendChild(element));
+  const header=document.createElement('div');
+  header.className='catalog-panel-head';
+  const button=document.createElement('button');
+  button.type='button';
+  button.id='catalogDisclosureButton';
+  button.className='secondary catalog-toggle';
+  button.addEventListener('click',()=>setCatalogDisclosure(document.getElementById('productCatalogDisclosure').hidden));
+  header.appendChild(title);
+  header.appendChild(button);
+  card.appendChild(header);
+  card.appendChild(disclosure);
+  document.head.insertAdjacentHTML('beforeend','<style>.catalog-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.catalog-panel-head h2{margin:0}.catalog-toggle{width:auto;white-space:nowrap}@media(max-width:559px){.catalog-panel-head{align-items:flex-start;flex-direction:column}.catalog-toggle{width:100%}}</style>');
+  setCatalogDisclosure(false);
+}
+installCatalogDisclosure();
+</script>
 </body>
 </html>
+
